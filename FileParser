@@ -1,0 +1,515 @@
+File Parser - @SS
+
+Responsible for taking input files uploaded via Ul or API, translating them into our internal representation and sending the data to Analytics to be processed
+
+App Flow:
+
+• For manual file uploads the Ul uploads the file to a webserver. This in turn puts the file into an 53 bucket - bestx-fileparar(-env)
+
+• For API and SFTP uploads a file is dropped directly into the bestx.api(.env) bucket
+
+• These buckets are configured to notify the lambda-sqs-publisher Lambda function when an object is created
+
+The Lambda function puts a notification onto the parser job queue - bestx-fileparser-(env)-input.fifo
+
+• Parser process picks up a job from the queue and processes it. Once the process has completed:
+
+• The complete report will be written into Postgres or KDB
+
+• The report will be submitted to Analytics to be processed further
+
+• The parser will write a completion notification onto one of two queues - either bestx-webserver-notify-(server id).fifo for manual uploads, where the server id is the webserver to which the file was originally uploaded, so that the Ul can be notified that the file was parsed successfully, or bestx-webserver-notify-(env)- broadcast.fifo for automated uploads, where any webserver can process the parsing complete message
+
+Main Components:
+
+FileParser
+
+• Main entry point for the parser
+
+• Polls an SQS input queue for jobs - when a job is received it pulls the inputs from S3, builds a job input and sends it to the FileProcessor to be processed
+
+On parse completion sends a notification to the webserver via SQS and delete the SQS message for the job from the queue
+
+
+FileProcessor
+
+• Sets up the processing of the file - pulls company and user data, data dictionary mappings, portfolio mappings and algo name to style mappings from Postgres
+
+Sends the file to SheetParser to load the trades from the file
+
+• Once the file has been loaded, send the trades to ReportSplitter to create the reports, dividing by client company if necessary
+
+• Sends each resulting report to ReportProcesser to be processed
+
+• Also manages periodic updating of the visibility timeout on the input SQS message, in order to avoid processing a message twice
+
+
+SheetParser
+
+Invokes SheetFactory to load the input file from disk into memory, wherever possible row-by-row to reduce memory footprint
+
+• Passes each row to TemplateMatcher until a matching template has been found. If none is found in any row an error is returned with a suggestion of what columns could be missing if applicable
+
+Once a template has been identified each row is passed to RowParser to be parsed into a trade object
+
+Resulting rows are added to the input trade map. If any duplicates are found it will attempt to deduplicate, and will return a warning for any duplicated rows
+
+
+SheetFactory
+
+For ZIP files unzips the file into a directory on disk
+
+Identifies the input file type and creates a specific ISheet implementation (e.g. for CSV/Excel/JSON/FIXML/SSGM Zip/..) based on this to allow the file to be read in
+
+ISheet implementations are each responsible for reading a certain file type, and will invoke a callback function for each row of data and another when they have finished reading the file
+
+TemplateMatcher
+
+• When started up loads up template information from templates.json
+
+Loops through all templates to find any where the row from the file matches the column names specified in the template (this is case-insensitive and ignores whitespace)
+
+A file matches a template if the header row contains all of the columns marked as required in the template
+
+• If multiple templates match the matcher will look through all the values in the header row, and if one of the headers is only found in a single template that template would be treated as the match
+
+If there is still not a single match the first would be returned
+
+
+RowParser
+
+Takes a row of input and converts it into a trade object
+
+Iterates over the elements of the template and uses them to index into the row based on the previously identified file headers to get a value (or values to combine together)
+
+For each resulting value convert it to our common format where required, and add to the resulting trade object
+
+Perform any validations on input data, such as for FX confirming that a Ccy Pair/Ccy is valid, or that a trade has a Completion Time and either a Spot or Forward Rate
+
+
+ReportSplitter
+
+Identifies the client companies present in the dataset, and creates one or more report objects for the trades based on this
+
+The result will be one report for the company uploading the file, and one report for each client company identified in the data
+
+
+Report Processer
+
+Calls TradeHierarchyBuilder to build a trade hierarchy from the input trade map
+
+• Invokes TradeResolver or FXAllTradeResolver to check for any existing data with hierarchy to be updated with the new data
+
+Cleans up the hierarchy to remove any single children
+
+Passes the final hierarchy to TradeMatcher to identify any trades that are the same as existing trades from a different source and merge them together
+
+Creates a ReportSubmitter to manage the building of files to send to Analytics
+
+Saves the trade and report data into Postgres/KDB as required
+
+Calls ReportSubmitter to send the input files to Analytics
+
+
+TradeHierarchy Builder
+
+• Responsible for building trade hierarchies from input trade maps and updating hierarchies after existing/aggregated trades have been added
+
+Maps values using the data dictionary
+
+Copies properties up and down the hierarchies to make them consistent
+
+• Relabels Swaps where necessary and runs Swap discovery logic based on company configuration
+
+• Sets Product, Amount, Direction and Timestamps using child data where applicable. Also calculates Price, Fwd Rate, Commission and Net Price if required
+
+• Finds cross trades and splits trade into component parts if necessary when trade is not a cross
+
+
+TradeResolver
+
+Looks for any trades with hierarchies overlapping those in the report, for example where a trade has been reuploaded
+
+If there are any, combines the old hierarchy with the new (in the case of an update or amend)
+
+• Update any trades that have been cancelled
+
+If Trade Aggregation is enabled in the company configuration, group the trades according to the configuration
+
+
+FXAII Trade Resolver
+
+• Handles updates for FXAII 113CE and 114CE files
+
+• Loads existing trades matching the new IDs and updates them with the new information
+
+TradeMatcher
+
+Iterates over trades, looking them up in Postgres to see if there are any matching trades that the trade needs to be merged with
+
+• If no matches are found, also checks any child trades
+
+• Loads the matching trades and calls MatchResolver to determine which trades need to be merged together
+
+Calls TradeMerger with the trades to run the merge and submit the trades
+
+
+TradeMerger
+
+• Iterates over the list of merges that was provided by TradeMatcher and merges the trades
+
+• Depending on the sources of the data and what trades have been uploaded, figure out which data to keep and set as Fills, Allocations and FwdRoll and which  trades to delete
+
+Client data takes precedence, followed by bank data then FXC/FXAII
+
+• Trades with Portfolio are treated as Allocations/FwdRoll is there are none explicitly sent with the group type set, with Forward trades treated as FwdRoll and Spot trades as Allocations
+
+Once trades have been merged together submit them to ReportSubmitter to be added to the Analytics input
+
+ReportSubmitter
+
+Creates files representing the reports to send to Analytics
+
+Called on the fly from TradeMerger to reduce memory footprint
+
+• Splits output based on total number of trades, size varies per asset class
+
+• On submit, files are written to Analytics input directory in S3
+
+Template Elements:
+
+A template is set up for each particular file type that we permit as an input, and defines how the basics of how the data in that file is translated to our internal representation. Each template has a number of main elements. These consist of:
+
+name - the name that is used to identify the template within the code to define specific actions
+
+version - the date the template was added
+
+overrides - a map that defines company specific overrides to the template
+
+	Key is the company name, value is a map of properties to be overridden and 	the values to use
+
+	This is currently used for timezone mappings, date and timestamp formats and fwdPointsScaleFactors
+
+timezones - a mapping used in equity which defines a conversion from a short abbreviated timezone name to their full name
+
+• fwdPointsScaleFactors - a mapping that defines scaling factors for certain FX currency pairs where the Forward Points need to be scaled before we can use them this is generally used when we are calculating the Forward Rate from the Price and the Points
+
+columns - this defines the actual mapping between the data in the file and the properties that would be set on the trade object itself • There are several required elements:
+
+name or names - the column name or names in the file from which the data for the mapping would be loaded
+
+⚫ name - load a single column from the file - this can either be a single column name or a map from company name to allow company specific overrides
+
+⚫ names - load multiple columns from the file to be combined together to set the property - this can either be an array of column names or a map from company name to allow company specific overrides
+
+separator - if names is used then this is used to set an optional separator to place between the column values that are loaded
+
+alias - an optional array of header names that may take the place of the name previously defined
+
+column- the property name to set on the trade
+
+type - the data type of the column data - Text/Number/Date/DateTime/Boolean
+
+required - whether the column is required in the file for the template to match and for a row to parse successfully. A template is matched based on the required columns, and if a row doesn't contain a value for a column marked as required it won't be loaded
+
+format-required for Date and DateTime columns - the format used by MomentJS to parse the value
+
+Then there are numerous optional elements that each define certain behaviours for parsing data
+
+timezone used for DateTime columns only, defines the timezone that the data in the file is specified in. This is defaulted to GMT if no timezone is provided. Should be provided as the full name from the ICANN/IANA database
+
+timezoneColumn - used for DateTime columns only, to define a second column that the timezone should be read from for each row
+
+withTimezone - used to specify that the value parsed from the column(s) also contains the timezone
+
+mapping - defines a hardcoded mapping between the values read from the file and the values that are stored
+
+abs- if specified then the values read for the column should have absolute value applied
+
+default - specifies a fallback value that should be used if no other value is read
+
+include - specifies that a column should be read from the file but not stored on the trade
+
+■defaultCcy - set on the Ccy Pair element for FX, specifies that the Ccy for the trade should be set as the base Ccy of the Ccy Pair, e.g. EUR for EURUSD
+
+■inferDirection - set on the Amount element, specifies that the Direction should be decided based on the sign of the Amount, i.e. Buy if positive and Sell if negative.
+
+singleParent-set on the Parent Order ID column, specifies that all the trades in the file should be set under a common parent that we derive
+
+fromFilename specifies that the value should be read from the filename and not the data row
+
+fromColumnHeader - specifies that the value should be read from the column header that contains the given string, and not from the data row
+
+fromColumn-specifies that the value should be taken from the column with header built from the combination of the provided name and the given property of the trade
+
+fromColumns - same as fromColumn but supports looking at multiple properties of the trade to build the column header
+
+isQuoteData - specifies that the element should define a quote data value column for elements with this enabled represents the Quote provider and
+
+name points to the column the quote should be read from
+
+• Finally there are various elements that can be specified for Quote Data columns:
+
+hasCount - specifies whether the columns used to build the Quote Data contain a numeric component (e.g. Counterparty/Price 1/2/3..)
+
+count - specifies the maximum number of quotes available in the file
+
+ordinal - specifies whether the columns contain the count in ordinal format rather than simply the number (e.g. with th/rd/st suffix)
+
+provider - specifies the column set from which to read the Counterparty for the quotes
+
+price - specifies the column set from which to read the Price for the quotes
+
+fwdPts - specifies the column set from which to read the Forward Points for the quotes
+
+fwdRate - specifies the column set from which to read the Forward Rate for the quotes
+
+farFwdRate-specifies the column set from which to read the Forward Rate for the quotes for the far leg of Swaps
+
+prices- specifies the columns from which to read the Price for the quotes this is used when the values in the file contain both bid and ask and we need to use one or the other
+
+fwdRates-specifies the columns from which to read the Forward Rate for the quotes - this is used when the values in the file contain both bid and ask and
+
+we need to use one or the other
+
+fxRate-specifies the column from which to read the FX Rate to store in the quote
+
+bid-specifies the column from which to read the Bid value to store in the quote
+
+ask-specifies the column from which to read the Ask value to store in the quote
+
+preset- this is used to define any hard-coded mappings for the file, where the data doesn't come directly from the file
+
+This can be either be a simple map containing the presets, or can have an outer map from company name to allow the presets to be defined on a per- company basis
+
+value the value to set in the trade property
+
+column- the property name to set on the trade
+
+Data Dictionary Mapping:
+
+The data dictionary is a mapping, stored in Postgres, which allows us to standardise the values that clients send on certain fields into a common set, so that we can perform better comparisons between clients. For example, Counterparty values can be sent in a wide range of different styles, which we can consolidate down into a set of recognised values (for example mapping BOA/Bank of America/Bank of America Merrill Lynch/etc to BAML internally). These mappings can be defined on most of the string input fields, and are applied in TradeHierarchyBuilder after we have built the hierarchy. We will go through all of the fields on each trade the client has sent, and attempt to map each one using the dictionary. If there is no mapping defined the input value will remain as-is. If a bank has defined mappings which affect client data, these will be applied for the data when it is copied to the client account, unless the client has an overriding mapping. If a client has a mapping this will not be applied on the data in the bank's account, only in the client account.
+
+Trade Amends, Updates:
+
+There are various scenarios where we may be resent a trade (in addition to user error). We usually discourage resending files, in favour of sending the final trade in one file, as this is less error-prone:
+
+• If a trade is amended we may be sent it again, with new values of the properties on parent or child
+
+For certain feeds, such as FIX or SSGM in equities, we may be sent the children of a trade across multiple uploads rather than all in one file
+
+a trade is resent, we would load all of the existing trade hierarchy from the DB in TradeResolver. Any existing hierarchy and the new hierarchy would then be combined together. For amends where a property is changed but the hierarchy has stayed the same we'd simply overwrite the old trade with the new one. If the trade has new children these would either overwrite the existing ones, for example in the case where the existing parent record is resent along with the new children, where we'd then remove any existing children not present in the new upload, or would be combined, for example in the case of FIX or SSGM where we might receive a new fill or allocation with a parent ID already exists, where we'd append the new child under the existing parent. In either case we'd rebuild the hierarchy so as to ensure the parent record still has the right values.
+
+Trade Cancels:
+
+If a client has cancelled a trade which they have previously sent to us, they would need to send us a cancellation record to ensure we remove the trade entry from BestX. In this case they would send a simple input file with just two columns - Order ID and Status. These would provide the Order ID to be cancelled, and the Status value CANCEL to indicate to us that we need to cancel the trade. These would be passed through the parser, and in the TradeResolver we would load the existing trades from the DB before updating them with the new status. The property set on the trade records written to the DB to indicate the cancellation is tradestatus = CANCEL. If the trade being cancelled is a parent then we would also cancel all of it's children, removing the whole trade. If a child trade is cancelled then we could not cancel the parent, but simply remove the child and update the parent properties to reflect the new amount etc for the trade. If however all of the children of a trade åre cancelled we would remove the parent.
+
+Swap Discovery:
+
+There are two main functions of the swap discovery feature. The first is for the case where a client may be able to send a Swap trade as one block but not be able to indicate that it is in fact a Swap, where we are able to relabel any trades that we deem to look like a Swap/NDS as such. The second is for the case where a client may not be able to pair up the individual components of the Swap, for example if in their system they are represented as separate Spot and Forward trades. In this case we are able to look at the uploaded trades and actively seek to pair them up to form Swaps if they meet certain criteria. This is applicable only for FX trades.
+
+• The feature is enabled via the admin Ul under "Discover Swaps in Input File"
+
+• This translates to the DB field discoverSwaps in the company table
+
+• The field can have one of three values. If turned off then no Swap Discovery or relabelling will be done. If set to default, trades that look like Swaps will be relabelled, but we won't do any discovery. If the feature is set to on, we will do both the relablling and the active Swap Discovery
+
+Relabelling:
+
+•Tries to identify if a trade looks like a Swap/NDS. If it does then update the Product to Swap accordingly. This can be either on parent or intermediate parent level.
+
+If the trade has two children then treat the trade as a Swap if:
+
+Neither child trade is an Option, Future, Bond or IRS trade
+
+The children have the same Ccy Pair
+
+• The children have the same Ccy but different Direction, or opposite Ccy and same Direction
+
+The children have different Value Dates
+
+At least one of the children is not a Spot trade
+
+The child Amounts are within 2bps of each other
+
+• If the trade has more than two children then the same logic as above is used, but summing up the children in each direction. The children should have at least two unique Value Dates (including Spot if present)
+
+Discovery:
+
+• Looks at trades on parent or intermediate parent level and attempts to identify whether any pairs of trades look like Swaps. If they do then pair up the trades, adding a new parent and setting the trades as it's children
+
+• Steps involved are:
+
+• Bucket the trades by Ccy Pair and Portfolio
+
+• Sort each bucket by Completion Time
+
+Iterate over the trades in each bucket and look for any trades within 2 seconds of each other
+
+If there are trades within the tim
+
+
+22222
+Certainly! Let’s go through a hypothetical example to illustrate how the File Parser system would process a sample file upload, with each component’s role highlighted.
+
+Example Scenario
+
+Let’s assume we have an Excel file, "Trades_2024-11-04.xlsx," uploaded by a client via the UI. This file contains FX trade data structured in columns like:
+
+Order ID
+
+Trade Date
+
+Ccy Pair (currency pair, e.g., EUR/USD)
+
+Amount
+
+Direction (e.g., Buy or Sell)
+
+Trade Time
+
+Spot Rate
+
+Counterparty
+
+
+Our goal is to process this file to:
+
+1. Parse and validate each row into a structured trade format.
+
+
+2. Create trade hierarchies if needed.
+
+
+3. Send the processed data to Analytics and store it in Postgres.
+
+
+
+Step-by-Step Process
+
+1. File Upload and Lambda Notification
+
+The client uploads "Trades_2024-11-04.xlsx" via the UI. This action sends the file to the S3 bucket bestx-fileparser-prod.
+
+The S3 bucket is set up to notify the lambda-sqs-publisher Lambda function when a new file is uploaded.
+
+The Lambda function places a notification in the bestx-fileparser-prod-input.fifo SQS queue, triggering the File Parser.
+
+
+
+2. FileParser Component
+
+The FileParser component polls the SQS queue and picks up the job.
+
+It fetches "Trades_2024-11-04.xlsx" from S3.
+
+The file is handed off to the FileProcessor for detailed parsing.
+
+
+
+3. FileProcessor Component
+
+FileProcessor sets up the environment, retrieving mappings from Postgres (e.g., client-specific data dictionary mappings, portfolio info).
+
+The file is sent to the SheetParser to load trades row-by-row.
+
+
+
+4. SheetParser Component
+
+SheetParser uses SheetFactory to identify the file type (Excel) and initializes the Excel reader to load rows into memory.
+
+For each row, it calls the TemplateMatcher to find a matching template.
+
+
+
+5. TemplateMatcher Component
+
+TemplateMatcher compares the file’s header row to predefined templates (like templates for FX trades). Let’s say it finds a matching template based on the columns.
+
+Now, each row is passed to the RowParser for conversion into trade objects.
+
+
+
+6. RowParser Component
+
+RowParser parses each row, extracting values based on the template:
+
+Order ID is assigned to the trade’s OrderID property.
+
+Ccy Pair (e.g., EUR/USD) is validated and set as CurrencyPair.
+
+Amount and Direction (Buy/Sell) are used to infer trade direction.
+
+The Trade Date and Trade Time are combined to set the TradeTimestamp.
+
+
+Validations take place, ensuring fields like Ccy Pair and Trade Time meet format requirements.
+
+Each row is now structured as a trade object and stored in a temporary trade map.
+
+
+
+7. Deduplication and Trade Aggregation (Optional)
+
+The SheetParser checks for duplicate rows. If duplicates are found, they are flagged and potentially deduplicated.
+
+If trade aggregation is enabled (for trades with the same Ccy Pair), TradeResolver will later group these rows.
+
+
+
+8. ReportSplitter Component
+
+ReportSplitter splits trades by client company if needed, generating one report per company.
+
+Each report is a subset of trades categorized by client, facilitating client-specific analysis and processing.
+
+
+
+9. Report Processer Component
+
+ReportProcesser calls TradeHierarchyBuilder to build any necessary trade hierarchies (e.g., linking trades if they’re part of the same deal).
+
+TradeResolver checks for overlapping trades in the database, updating existing hierarchies if a trade reappears.
+
+TradeMatcher searches for duplicates across sources and prepares to merge any matching trades.
+
+
+
+10. Trade Merging (if duplicates exist)
+
+TradeMerger merges matching trades, prioritizing data from client over bank-provided data.
+
+For example, if both client and bank have uploaded details for the same EUR/USD trade, they are combined to avoid redundancy.
+
+
+
+11. Report Submission
+
+ReportSubmitter formats the final trade data and sends it to Analytics for further processing.
+
+It writes trade data into Postgres (for structured storage) or KDB (for high-performance analytics).
+
+
+
+12. Completion Notification
+
+FileParser posts a message to the appropriate SQS queue (e.g., bestx-webserver-notify-prod.fifo) to notify the UI that parsing was successful.
+
+
+
+
+Key Points
+
+Template-Driven Parsing: TemplateMatcher uses templates.json to identify how to parse each column, making it adaptable to various formats.
+
+Hierarchy Building and Aggregation: TradeHierarchyBuilder and TradeResolver handle complex tasks like organizing trades hierarchically and grouping similar trades.
+
+Trade Deduplication and Merging: Ensures data integrity by combining duplicates, giving priority to the client’s data where applicable.
+
+
+Final Outcome
+
+The file "Trades_2024-11-04.xlsx" has been parsed, validated, de-duplicated, and processed with all relevant trades stored in Postgres and ready for Analytics processing. Notifications confirm the completion, allowing end-users to proceed with data analysis or further trade processing.
+
+This example illustrates how each component works together to transform raw uploaded data into a structured, analytics-ready format while managing errors, duplications, and client-specific configurations. Let me know if you'd like to dive deeper into any specific component or concept from this flow!
