@@ -1,0 +1,184 @@
+import boto3
+import redis
+import os
+import json
+import logging
+from datetime import datetime
+from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+class RedisHealthCheck:
+    def __init__(self):
+        self.sns_client = boto3.client('sns')
+        self.elasticache_client = boto3.client('elasticache')
+        self.sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+        self.cluster_id = os.environ.get('CACHE_CLUSTER_ID')
+        self.strict_timeout = float(os.environ.get('PING_TIMEOUT', '1.0'))
+        
+    def check_node_health(self, host, port=6379, password=None):
+        """
+        Check individual node health with strict timeout
+        """
+        try:
+            redis_client = redis.Redis(
+                host=host,
+                port=port,
+                password=password,
+                socket_timeout=self.strict_timeout,
+                socket_connect_timeout=self.strict_timeout,
+                health_check_interval=0
+            )
+            
+            # Perform PING with strict timeout
+            if not redis_client.ping():
+                raise redis.ConnectionError("PING command failed")
+                
+            # Get additional node metrics
+            info = redis_client.info()
+            metrics = {
+                'connected_clients': info.get('connected_clients', 0),
+                'used_memory_peak': info.get('used_memory_peak', 0),
+                'uptime_in_seconds': info.get('uptime_in_seconds', 0)
+            }
+            
+            return True, metrics
+            
+        except redis.TimeoutError:
+            return False, "Node response timeout after {} seconds".format(self.strict_timeout)
+        except redis.ConnectionError as e:
+            return False, f"Connection error: {str(e)}"
+        except Exception as e:
+            return False, f"Unexpected error: {str(e)}"
+        finally:
+            try:
+                redis_client.close()
+            except:
+                pass
+
+    def check_cluster_health(self):
+        """
+        Check entire cluster health using ElastiCache API
+        """
+        try:
+            response = self.elasticache_client.describe_cache_clusters(
+                CacheClusterId=self.cluster_id,
+                ShowCacheNodeInfo=True,
+                MaxRecords=100
+            )
+            
+            cluster_status = []
+            unhealthy_nodes = []
+            
+            for cluster in response['CacheClusters']:
+                for node in cluster['CacheNodes']:
+                    node_info = {
+                        'node_id': node['CacheNodeId'],
+                        'status': node['CacheNodeStatus'],
+                        'endpoint': node.get('Endpoint', {}).get('Address'),
+                        'port': node.get('Endpoint', {}).get('Port')
+                    }
+                    
+                    # Check if node is available
+                    if node_info['status'] != 'available':
+                        unhealthy_nodes.append(node_info)
+                    
+                    # Perform direct health check if endpoint available
+                    if node_info['endpoint']:
+                        is_healthy, metrics = self.check_node_health(
+                            node_info['endpoint'],
+                            node_info['port']
+                        )
+                        node_info['direct_check'] = {
+                            'healthy': is_healthy,
+                            'metrics': metrics if is_healthy else None,
+                            'error': None if is_healthy else metrics
+                        }
+                    
+                    cluster_status.append(node_info)
+            
+            return cluster_status, unhealthy_nodes
+            
+        except ClientError as e:
+            logger.error(f"AWS API error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in cluster health check: {str(e)}")
+            raise
+
+    def send_alert(self, subject, message):
+        """
+        Send alert via SNS with enhanced information
+        """
+        try:
+            if not self.sns_topic_arn:
+                raise ValueError("SNS Topic ARN not configured")
+            
+            full_message = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'cluster_id': self.cluster_id,
+                'alert_type': subject,
+                'details': message
+            }
+            
+            self.sns_client.publish(
+                TopicArn=self.sns_topic_arn,
+                Subject=f"Redis Cluster Alert: {subject}",
+                Message=json.dumps(full_message, indent=2)
+            )
+            logger.info(f"Alert sent successfully: {subject}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send alert: {str(e)}")
+            raise
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler for Redis health monitoring
+    """
+    try:
+        monitor = RedisHealthCheck()
+        
+        # Perform cluster-wide health check
+        cluster_status, unhealthy_nodes = monitor.check_cluster_health()
+        
+        # Determine overall health and alert if needed
+        if unhealthy_nodes:
+            alert_message = {
+                'unhealthy_nodes': unhealthy_nodes,
+                'cluster_status': cluster_status
+            }
+            monitor.send_alert(
+                'Unhealthy Nodes Detected',
+                alert_message
+            )
+            return {
+                'statusCode': 500,
+                'body': json.dumps({
+                    'status': 'UNHEALTHY',
+                    'details': alert_message
+                })
+            }
+        
+        # Log success status
+        logger.info(f"Cluster health check completed successfully: {len(cluster_status)} nodes checked")
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'status': 'HEALTHY',
+                'cluster_status': cluster_status
+            })
+        }
+        
+    except Exception as e:
+        error_message = f"Health check failed: {str(e)}"
+        logger.error(error_message)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'status': 'ERROR',
+                'error': error_message
+            })
+        }
