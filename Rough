@@ -1,3 +1,44 @@
+Business Process Updates
+Interim Process Designs
+Business User Description
+Rollout Strategy
+No missing sections.
+Architectural Design
+Proposed Architectural Design (mandatory)
+Final Architectural Design (mandatory)
+Interim Architectural Designs
+As-built Architectural Design
+Non Functional Requirements (mandatory)
+Architectural Standards
+Services / Components / Business Application Code
+Shared Services / Reusable Components
+Life Cycle Environments under Deployment Model
+Resiliency Model
+Deviations from standard resiliency models
+Throughput / Load Expectations and Testing (mandatory)
+Data Strategy and Governance (mandatory)
+What needs to be persisted for this solution
+What is the logical data model (A diagram helps here)
+Quantity of data
+Retention requirements
+What is the data strategy / storage solution
+Use of Authoritative Sources/Systems of Record
+Data Distributions
+Data Governance
+Definition of Data Quality Dimensions
+Critical Data Identification
+Sensitive Data Identification
+Security Model and Entitlement Protocols
+Authentication
+Authorization / Entitlements
+Propagation
+UI Considerations
+UI Concurrent Users
+UI performance
+UI User Experience
+Third-Party Software and Open-Source Software Products
+What third-party or open-source technology will be included in this solution?
+
 import boto3
 import redis
 import os
