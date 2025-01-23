@@ -1,20 +1,7 @@
 fields @timestamp, @message
-| filter (
-    (isValidJson(@message) and 
-     parse_json(@message).transferDetails.username is not null and 
-     parse_json(@message).details.stepName = 'copy') or 
-    (strcontains(@message, 'CONNECTED SourceIP='))
-)
-| parse (
-    case 
-    when isValidJson(@message) 
-    then parse_json(@message).transferDetails.username
-    when strcontains(@message, 'CONNECTED')
-    then trim(substring(@message, strpos(@message, 'User=') + 5))
-    else null
-    end as username
-)
-| stats 
-    count_distinct(case when parse_json(@message).details.stepName = 'copy' then username else null end) as FileUploadUsers,
-    count_distinct(case when strcontains(@message, 'CONNECTED') then username else null end) as InfraOnlyUsers
+| filter ("stepName" = "copy" and "username" != "")
+  or "CONNECTED" in @message
+| parse @message /"username":\s*"(?<company_name>[^"]+)"/ as company_name
+| parse @message /"User":(?<company_name>[^ ]+)/ as company_name_connected
+| stats count(distinct company_name) as FileUploadUsers, count(distinct company_name_connected) as InfraOnlyUsers by bin(@timestamp, 1h)
 | sort @timestamp desc
