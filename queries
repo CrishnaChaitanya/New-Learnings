@@ -1,21 +1,20 @@
 fields @timestamp, @message
 | filter (
-    (parse_json(@message).transferDetails.username is not null and 
+    (isValidJson(@message) and 
+     parse_json(@message).transferDetails.username is not null and 
      parse_json(@message).details.stepName = 'copy') or 
-    (strcontains(@message, 'CONNECTED'))
+    (strcontains(@message, 'CONNECTED SourceIP='))
 )
-| compute (
-    count_distinct(
-        if(parse_json(@message).transferDetails.username is not null and 
-           parse_json(@message).details.stepName = 'copy', 
-           parse_json(@message).transferDetails.username,
-           null)
-    ) as FileUploadUsers,
-    count_distinct(
-        if(strcontains(@message, 'CONNECTED'), 
-           split(filter(@message, 'User=')[0], ' ')[1],
-           null)
-    ) as InfraOnlyUsers
+| parse (
+    case 
+    when isValidJson(@message) 
+    then parse_json(@message).transferDetails.username
+    when strcontains(@message, 'CONNECTED')
+    then trim(substring(@message, strpos(@message, 'User=') + 5))
+    else null
+    end as username
 )
+| stats 
+    count_distinct(case when parse_json(@message).details.stepName = 'copy' then username else null end) as FileUploadUsers,
+    count_distinct(case when strcontains(@message, 'CONNECTED') then username else null end) as InfraOnlyUsers
 | sort @timestamp desc
-| limit 10
