@@ -1,36 +1,6 @@
 SELECT 
-    COUNT(DISTINCT 
-        CASE 
-        WHEN JSON_EXTRACT(message, '$.details.stepName') = 'copy' 
-        THEN JSON_EXTRACT(message, '$.transferDetails.username')
-        END
-    ) AS FileUploadUsers,
-    COUNT(DISTINCT 
-        CASE 
-        WHEN message LIKE '%CONNECTED%' 
-        THEN SUBSTRING(message FROM 'User=([^ ]+)')
-        END
-    ) AS InfraOnlyUsers
+   REGEXP_EXTRACT(log_stream, '^([^.]+)') AS company,
+   COUNT(DISTINCT company) AS file_upload_count
 FROM logs
-WHERE 
-    (JSON_VALID(message) AND JSON_EXTRACT(message, '$.details.stepName') = 'copy')
-    OR 
-    message LIKE '%CONNECTED%'
-
-
-SELECT 
-    CASE 
-        WHEN message LIKE '%"stepName": "copy"%' THEN 'FileUploadUsers'
-        WHEN message LIKE '%CONNECTED%' AND message LIKE '%User=%' THEN 'InfraOnlyUsers'
-        ELSE 'Unknown'
-    END AS user_type,
-    COUNT(DISTINCT CASE 
-                      WHEN message LIKE '%"stepName": "copy"%' THEN JSON_VALUE(message, '$.transferDetails.username')
-                      WHEN message LIKE '%CONNECTED%' AND message LIKE '%User=%' THEN REGEXP_SUBSTR(message, 'User=([^ ]+)')
-                   END) AS company_count
-FROM logs
-WHERE message IS NOT NULL
-GROUP BY user_type
-ORDER BY user_type;
-
-
+WHERE log_stream LIKE '%.w-%'
+GROUP BY company
