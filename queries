@@ -16,3 +16,19 @@ WHERE
     (JSON_VALID(message) AND JSON_EXTRACT(message, '$.details.stepName') = 'copy')
     OR 
     message LIKE '%CONNECTED%'
+
+
+source=logs
+| eval user_type = case(
+    like(message, '%"stepName": "copy"%'), "FileUploadUsers",
+    like(message, '%CONNECTED%') and like(message, '%User=%'), "InfraOnlyUsers",
+    "Unknown"
+)
+| eval company_name = case(
+    like(message, '%"stepName": "copy"%'), json_value(message, 'transferDetails.username'),
+    like(message, '%CONNECTED%') and like(message, '%User=%'), regex(message, 'User=([^ ]+)'),
+    null
+)
+| stats count_distinct(company_name) as company_count by user_type
+| sort user_type
+
