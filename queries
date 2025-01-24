@@ -1,6 +1,18 @@
-fields @logStream
-| parse @logStream /^([a-zA-Z0-9_]+)\./ as company_name
-| filter @logStream like /.*\.w-.*/ or @logStream not like /.*\.w-.*/
-| stats 
-    count(distinct if(@logStream like /.*\.w-.*/, company_name, null)) as FileUploadUsers, 
-    count(distinct if(@logStream not like /.*\.w-.*/, company_name, null)) as InfraOnlyUsers
+SELECT 
+    COUNT(DISTINCT 
+        CASE 
+        WHEN JSON_EXTRACT(message, '$.details.stepName') = 'copy' 
+        THEN JSON_EXTRACT(message, '$.transferDetails.username')
+        END
+    ) AS FileUploadUsers,
+    COUNT(DISTINCT 
+        CASE 
+        WHEN message LIKE '%CONNECTED%' 
+        THEN SUBSTRING(message FROM 'User=([^ ]+)')
+        END
+    ) AS InfraOnlyUsers
+FROM logs
+WHERE 
+    (JSON_VALID(message) AND JSON_EXTRACT(message, '$.details.stepName') = 'copy')
+    OR 
+    message LIKE '%CONNECTED%'
