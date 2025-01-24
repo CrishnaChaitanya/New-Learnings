@@ -1,7 +1,6 @@
-fields @timestamp, @message
-| filter ("stepName" = "copy" and "username" != "")
-  or "CONNECTED" in @message
-| parse @message /"username":\s*"(?<company_name>[^"]+)"/ as company_name
-| parse @message /"User":(?<company_name>[^ ]+)/ as company_name_connected
-| stats count(distinct company_name) as FileUploadUsers, count(distinct company_name_connected) as InfraOnlyUsers by bin(@timestamp, 1h)
-| sort @timestamp desc
+fields @logStream
+| parse @logStream /^([a-zA-Z0-9_]+)\./ as company_name
+| filter @logStream like /.*\.w-.*/ or @logStream not like /.*\.w-.*/
+| stats 
+    count(distinct if(@logStream like /.*\.w-.*/, company_name, null)) as FileUploadUsers, 
+    count(distinct if(@logStream not like /.*\.w-.*/, company_name, null)) as InfraOnlyUsers
