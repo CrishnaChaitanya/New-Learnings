@@ -18,17 +18,19 @@ WHERE
     message LIKE '%CONNECTED%'
 
 
-source=logs
-| eval user_type = case(
-    like(message, '%"stepName": "copy"%'), "FileUploadUsers",
-    like(message, '%CONNECTED%') and like(message, '%User=%'), "InfraOnlyUsers",
-    "Unknown"
-)
-| eval company_name = case(
-    like(message, '%"stepName": "copy"%'), json_value(message, 'transferDetails.username'),
-    like(message, '%CONNECTED%') and like(message, '%User=%'), regex(message, 'User=([^ ]+)'),
-    null
-)
-| stats count_distinct(company_name) as company_count by user_type
-| sort user_type
+SELECT 
+    CASE 
+        WHEN message LIKE '%"stepName": "copy"%' THEN 'FileUploadUsers'
+        WHEN message LIKE '%CONNECTED%' AND message LIKE '%User=%' THEN 'InfraOnlyUsers'
+        ELSE 'Unknown'
+    END AS user_type,
+    COUNT(DISTINCT CASE 
+                      WHEN message LIKE '%"stepName": "copy"%' THEN JSON_VALUE(message, '$.transferDetails.username')
+                      WHEN message LIKE '%CONNECTED%' AND message LIKE '%User=%' THEN REGEXP_SUBSTR(message, 'User=([^ ]+)')
+                   END) AS company_count
+FROM logs
+WHERE message IS NOT NULL
+GROUP BY user_type
+ORDER BY user_type;
+
 
