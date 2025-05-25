@@ -308,3 +308,81 @@ log.info("IBMMQ connectioneventmap send{}", connectionEventMap);
 return connectionEvent;
 
 }
+
+---------
+
+Fundconnect.monitoring.model.ConnectionEventMap;
+
+import lombok.extern.slf4j.slf4j;
+
+import org.springframework.beans.factory.annotation.Autowired;
+
+import org.springframework.jms.annotation.JmsListener;
+
+import org.springframework.stereotype.Component;
+
+@Component
+
+@slf4j
+
+public class JMSConnectionEventReceiver {
+
+public volatile ConnectionEventMap<String, ConnectionEvent> connectionEventMap;
+
+@Autowired
+
+public JMSConnectionEventReceiver(ConnectionEventMap<String, ConnectionEvent> connectionEventMap) {
+
+this.connectionEventMap = connectionEventMap;
+
+}
+
+@msListener(destination = "DEV.QUEUE.1", containerFactory = "jmsListenerContainerFactory")
+
+public void receiveMessage(String message) {
+
+log.info("IBMMQ connectionEventMap Received{}", message);
+
+try {
+
+I
+
+log.info("IBMMQ Received MessageData{}", message);
+
+updateCorrelationId(message);
+
+log.info("IBMMQ connectionEventMap Received()", message);
+
+} catch (Exception e) {
+
+log.error("Error receiving {}", message, e);
+
+}
+
+private void updateCorrelationId(String received CorrelationId) {
+
+log.info("MQ Received message with (): SUCCESS", SUCCESS", received CorrelationId);
+
+log.info("connectionEventMap:() in updateCorrelation", connectionEventMap);
+
+connectionEventMap.forEach((correlation, connectionEvent) -> {
+
+connectionEventMap.forEach((correlation, connectionEvent) -> {
+
+log.info("JMS xmlPayload: {} in updateCorrelation", correlation);
+
+if (correlation.equals(received CorrelationId)) {
+
+log.info("correlation equals correlationId");
+
+connectionEvent.setReceiveTime (System.currentTimeMillis());
+
+connectionEvent.setStatus(ConnectionEvent.STATUS.UP);
+
+}
+
+log.info("IBMMQ connectioneventmap Received{}", connectionEventMap);
+
+log.info("receeve message: connectionEvent: {}", connectionEvent);
+
+log.info("in updateCorrelationId action map after success {}", connectionEventMap.size());
